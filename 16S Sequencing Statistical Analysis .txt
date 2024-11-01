@@ -1,0 +1,567 @@
+
+#Set working directory
+library(dada2)
+setwd("~/data/Yogita/16S_Sequencing/")
+getwd()
+path <- "~/data/Yogita/16S_Sequencing/" # CHANGE ME to the directory containing the fastq files after unzipping.
+list.files(path)
+
+
+# Forward and reverse fastq filenames have format: SAMPLENAME_R1_001.fastq and SAMPLENAME_R2_001.fastq
+fnFs <- sort(list.files(path, pattern="_R1_001.fastq", full.names = TRUE))
+fnRs <- sort(list.files(path, pattern="_R2_001.fastq", full.names = TRUE))
+
+# Extract sample names, assuming filenames have format: SAMPLENAME_XXX.fastq
+sample.names <- sapply(strsplit(basename(fnFs), "_"), `[`, 1)
+
+#Quality Assessment for first two files
+plotQualityProfile(fnFs[1:2])
+plotQualityProfile(fnRs[1:2])
+
+# Quality Filtering and Trimming - Create a filtered directory
+filtFs <- file.path(path, "filtered", paste0(sample.names, "_F_filt.fastq.gz"))
+filtRs <- file.path(path, "filtered", paste0(sample.names, "_R_filt.fastq.gz"))
+names(filtFs) <- sample.names
+names(filtRs) <- sample.names
+
+out <- filterAndTrim(fnFs, filtFs, fnRs, filtRs, truncLen=c(250,250), trimLeft = c(16,24),
+                     maxN=0, maxEE=c(2,2), truncQ=2, rm.phix=TRUE,
+                     compress=TRUE, multithread=FALSE) # On Windows set multithread=FALSE
+
+
+#Learn the Error Rates
+
+errF <- learnErrors(filtFs, multithread=TRUE)
+errR <- learnErrors(filtRs, multithread=TRUE)
+plotErrors(errF, nominalQ=TRUE)
+plotErrors(errR, nominalQ = TRUE)
+
+dadaFs <- dada(filtFs, err=errF, multithread=TRUE)
+dadaRs <- dada(filtRs, err=errR, multithread=TRUE)
+dadaFs[[1]]
+
+#Merge Paired Reads
+
+mergers <- mergePairs(dadaFs, filtFs, dadaRs, filtRs, verbose=TRUE)
+head(mergers[[1]])
+
+saveRDS(mergers, file="corrected_mergers.rds")
+
+#Construct sequence table
+
+seqtab <- makeSequenceTable(mergers)
+dim(seqtab)
+
+#Remove chimeras
+
+seqtab.nochim <- removeBimeraDenovo(seqtab, method="consensus", verbose=TRUE)
+dim(seqtab.nochim)
+
+sum(seqtab.nochim)/sum(seqtab)
+
+
+#Track reads through the pipeline
+
+getN <- function(x) sum(getUniques(x))
+track <- cbind(out, sapply(dadaFs, getN), sapply(dadaRs, getN), sapply(mergers, getN), rowSums(seqtab.nochim))
+
+# If processing a single sample, remove the sapply calls: e.g. replace sapply(dadaFs, getN) with getN(dadaFs)
+colnames(track) <- c("input", "filtered", "denoisedF", "denoisedR", "merged", "nonchim")
+rownames(track) <- sample.names
+head(track)
+
+#Assign Taxonomy
+
+taxa <- assignTaxonomy(seqtab.nochim, "/data/home/sharedDatabases/Silva/silva_nr99_v138.1_train_set.fa.gz")
+taxa <- addSpecies(taxa, "/data/home/sharedDatabases/Silva/silva_species_assignment_v138.1.fa.gz")
+taxa.print <- taxa # Removing sequence rownames for display only
+rownames(taxa.print) <- NULL
+head(taxa.print)
+
+#Save files
+saveRDS(seqtab.nochim,"seqtab.nochim.RDS")
+saveRDS(taxa,"taxa.RDS")
+
+#Load the saved files to environment
+seqtab.nochim <- readRDS("seqtab.nochim.RDS")
+
+taxa2<-readRDS("taxa.RDS")
+
+# Check the dimensions of seqtab.nochim and taxa2
+dim(seqtab.nochim)
+head(taxa2)
+
+file.exists("taxa.RDS")
+str(taxa2)
+
+##Phyloseq Stuff
+
+library(phyloseq)
+library(tidyverse)
+library(vegan)
+
+##read in metadata
+
+meta<-read.csv("16S Sequencing PCOA plot .csv")
+#verify the data
+head(meta)
+
+meta<-column_to_rownames(meta, var="SampleID")
+
+#Read everything into phyloseq format
+
+ps <- phyloseq(otu_table(seqtab.nochim, taxa_are_rows=FALSE), 
+               sample_data(meta), 
+               tax_table(taxa2))
+
+#Make headers nicer for phyloseq
+
+dna <- Biostrings::DNAStringSet(taxa_names(ps))
+names(dna) <- taxa_names(ps)
+ps <- merge_phyloseq(ps, dna)
+taxa_names(ps) <- paste0("ASV", seq(ntaxa(ps)))
+ps
+
+#clean phyloseq object
+
+#Remove samples with less than the desired number of reads (1000 in this examples)
+samplesover1000_all <- subset_samples(ps, sample_sums(ps) > 1000)
+
+
+#Check to make sure that the fewest number of reads in a sample is more than 1000
+
+min(sample_sums(samplesover1000_all))
+
+
+#Clean up ASVs with no counts after sample removal
+##Check if there are OTUs with no counts, if so how many?
+
+any(taxa_sums(samplesover1000_all) == 0)
+sum(taxa_sums(samplesover1000_all) == 0)
+
+#Remove taxa with no counts
+
+prune_samplesover1000_all <- prune_taxa(taxa_sums(samplesover1000_all) > 0, samplesover1000_all)
+any(taxa_sums(prune_samplesover1000_all) == 0)
+
+#Rarefy the remaining samples to the minimum number of reads in the samples
+
+rarefy_samplesover1000_all <- rarefy_even_depth(prune_samplesover1000_all, rngseed= 81, sample.size = min(sample_sums(prune_samplesover1000_all)))
+
+
+min(sample_sums(prune_samplesover1000_all))
+#92075- corrected
+
+
+#remove unwanted taxonomic groups 
+
+justbacteria<- rarefy_samplesover1000_all %>%
+  subset_taxa(
+    (Kingdom == "Bacteria" | Kingdom == "Archaea") & # include both Bacteria and Archaea
+      Family  != "mitochondria" &                     #filter out mitochondria
+      Class   != "Chloroplast"                         #filter out chloroplasts
+  )
+
+min(sample_sums(justbacteria))
+
+
+#calculate alpha diversity
+
+alpha<-estimate_richness(justbacteria)
+
+
+#Move sample IDs to column
+
+alpha<-rownames_to_column(alpha, var="SampleID")
+
+
+#export sample data
+
+sample<-justbacteria@sam_data
+
+sample<-as.data.frame(as.matrix(justbacteria@sam_data))
+
+sample1<-rownames_to_column(sample, var="SampleID")
+
+
+#Merge sample data and alpha diversity 
+
+joined<-full_join(alpha,sample1)
+
+
+#alpha diversity stats - Old Code
+
+colnames(joined)
+
+ggplot(joined, aes(x=Location, y=Shannon)) +
+  geom_boxplot() +
+  geom_jitter(aes(color=Depth), shape=16, position=position_jitter(0.1), size=4)
+
+ord.pcoa.bray <- ordinate(justbacteria, method="PCoA", distance="bray")
+
+plot_ordination(justbacteria, ord.pcoa.bray, color="Location", title="Bray PCoA") + 
+  theme_bw()
+
+plot_ordination(justbacteria, ord.pcoa.bray, color="Depth", shape="Location", title="Bray PCoA") + 
+  theme_bw() +
+  scale_shape_manual(values = c(16, 17)) +  # Different shapes for different locations
+  theme(legend.position = "right")
+
+# Code - pcoa plot - color palette change , point size change ,
+# Load required libraries
+library(ggplot2)
+library(RColorBrewer)
+
+
+Color_Palette <- c("#FF0000",  # 0-4 cm - bright red
+                   "#004949",  # 4-8 cm - existing color
+                   "#009292",  # 8-12 cm - existing color
+                   "#6A0DAD",  # 12-16 cm - dark purple
+                   "#ffb6db",  # 16-20 cm - existing color
+                   "blue",     # 20-24 cm - existing color
+                   "#32CD32",  # 24-29 cm - vivid green
+                   "#b66dff")  # 28-35 cm - existing color
+
+
+# Ensure Depth is a factor and ordered correctly (use ordered = TRUE to guarantee order)
+joined$Depth <- factor(joined$Depth, levels = c("0-4 cm", "4-8 cm", "8-12 cm", "12-16 cm", "16-20 cm", 
+                                                "20-24 cm", "24-29 cm", "28-35 cm"), ordered = TRUE)
+
+joined$Depth
+# Plot with updated font size, point size, and custom color palette
+plot_ordination(justbacteria, ord.pcoa.bray, color="Depth", shape="Location", title="Bray-Curtis PCoA of Microbial Communities by Depth in Caspian and Mediterranean Seas") + 
+  theme_bw() +
+  scale_shape_manual(values = c(16, 17)) +  # Different shapes for different locations
+  scale_color_manual(values = Color_Palette, breaks=c("0-4 cm", "4-8 cm", "8-12 cm", "12-16 cm", "16-20 cm", 
+                                                      "20-24 cm", "24-29 cm", "28-35 cm")) +  # Apply custom color palette with visible color for "0-4 cm"
+  geom_point(size = 4) +  # Increase the point size (dots and triangles)
+  theme(legend.position = "right",
+        axis.text.x = element_text(size = 15),  # Increase font size of x-axis labels
+        axis.text.y = element_text(size = 15),  # Increase font size of y-axis labels
+        axis.title = element_text(size = 20),   # Increase font size of axis titles
+        legend.text = element_text(size = 15),  # Increase font size of legend text
+        legend.title = element_text(size = 15)) # Increase font size of legend title
+
+
+# Check the structure of the Depth column
+str(joined$Depth)
+
+# Check the unique levels in Depth to ensure they are all present
+levels(joined$Depth)
+
+
+#PCOA Plot - Code for separate cas and med sea pcoa plot
+
+# Subset the data for Caspian Sea and Mediterranean Sea
+justbacteria_caspian <- subset_samples(justbacteria, Location == "Cas_Sea")
+justbacteria_med <- subset_samples(justbacteria, Location == "Med_Sea")
+
+# Perform PCoA for Caspian Sea
+ord.pcoa.bray_caspian <- ordinate(justbacteria_caspian, method="PCoA", distance="bray")
+
+# Perform PCoA for Mediterranean Sea
+ord.pcoa.bray_med <- ordinate(justbacteria_med, method="PCoA", distance="bray")
+
+
+# Define the custom color palette with a visible color for "0-4 cm"
+#Color_Palette <- c("#000000","#004949","#009292","wheat","#ffb6db",
+                   #"blue","lightblue","#b66dff","cyan","orange",
+                   #"darkgray","#924900","#db6d00","#24ff24","#ffff6d")
+
+Color_Palette <- c("#FF0000",  # 0-4 cm - bright red
+                   "#004949",  # 4-8 cm - existing color
+                   "#009292",  # 8-12 cm - existing color
+                   "#6A0DAD",  # 12-16 cm - dark purple
+                   "#ffb6db",  # 16-20 cm - existing color
+                   "blue",     # 20-24 cm - existing color
+                   "#32CD32",  # 24-29 cm - vivid green
+                   "#b66dff")  # 28-35 cm - existing color
+
+
+# Plot for Caspian Sea
+plot_ordination(justbacteria_caspian, ord.pcoa.bray_caspian, color="Depth", title="Bray-Curtis PCoA of Microbial Communities by Depth in Caspian Sea") + 
+  theme_bw() +
+  scale_color_manual(values = Color_Palette, breaks=c("0-4 cm", "4-8 cm", "8-12 cm", "12-16 cm", "16-20 cm", 
+                                                      "20-24 cm", "24-29 cm", "28-35 cm")) +  # Apply custom color palette
+  
+  #scale_shape_manual(values = c(17)) + 
+  geom_point(size = 4, ) +  # Increase the point size
+  theme(legend.position = "right",
+        axis.text.x = element_text(size = 15),  # Increase font size of x-axis labels
+        axis.text.y = element_text(size = 15),  # Increase font size of y-axis labels
+        axis.title = element_text(size = 20),   # Increase font size of axis titles
+        legend.text = element_text(size = 15),  # Increase font size of legend text
+        legend.title = element_text(size = 15)) # Increase font size of legend title
+
+
+# Plot for Mediterranean Sea
+plot_ordination(justbacteria_med, ord.pcoa.bray_med, color="Depth", title="Bray-Curtis PCoA of Microbial Communities by Depth in Mediterranean Sea") + 
+  theme_bw() +
+  scale_color_manual(values = Color_Palette, breaks=c("0-4 cm", "4-8 cm", "8-12 cm", "12-16 cm", "16-20 cm", 
+                                                      "20-24 cm", "24-29 cm" )) +  # Apply custom color palette
+  geom_point(size = 4) +  # Increase the point size
+  theme(legend.position = "right",
+        axis.text.x = element_text(size = 15),  # Increase font size of x-axis labels
+        axis.text.y = element_text(size = 15),  # Increase font size of y-axis labels
+        axis.title = element_text(size = 20),   # Increase font size of axis titles
+        legend.text = element_text(size = 15),  # Increase font size of legend text
+        legend.title = element_text(size = 15)) # Increase font size of legend title
+
+
+#Permanova analysis 
+# Load necessary libraries
+library(phyloseq)
+library(vegan)
+
+# Step 1: Subset the phyloseq object for Caspian Sea and Mediterranean Sea
+justbacteria_caspian <- subset_samples(justbacteria, Location == "Cas_Sea")
+justbacteria_med <- subset_samples(justbacteria, Location == "Med_Sea")
+
+# Step 2: Ensure Depth is treated as a factor in the metadata
+meta_data_caspian <- data.frame(sample_data(justbacteria_caspian))
+meta_data_med <- data.frame(sample_data(justbacteria_med))
+
+meta_data_caspian$Depth <- as.factor(meta_data_caspian$Depth)
+meta_data_med$Depth <- as.factor(meta_data_med$Depth)
+
+# Step 3: Calculate Bray-Curtis distance matrices for both datasets
+bray_dist_caspian <- phyloseq::distance(justbacteria_caspian, method = "bray")
+bray_dist_med <- phyloseq::distance(justbacteria_med, method = "bray")
+
+# Step 4: Run PERMANOVA for Caspian Sea
+permanova_caspian <- adonis2(bray_dist_caspian ~ Depth, data = meta_data_caspian, permutations = 999)
+print("PERMANOVA Results for Caspian Sea")
+print(permanova_caspian)
+
+# Step 5: Run PERMANOVA for Mediterranean Sea
+permanova_med <- adonis2(bray_dist_med ~ Depth, data = meta_data_med, permutations = 999)
+print("PERMANOVA Results for Mediterranean Sea")
+print(permanova_med)
+
+
+#Full Code for PERMANOVA by Basin:
+
+# Ensure Location is treated as a factor
+meta_data <- data.frame(sample_data(justbacteria))
+meta_data$Location <- as.factor(meta_data$Location)
+
+# Calculate Bray-Curtis distance matrix for all samples
+bray_dist <- phyloseq::distance(justbacteria, method = "bray")
+
+# Run PERMANOVA comparing Caspian Sea and Mediterranean Sea
+permanova_basin <- adonis2(bray_dist ~ Location, data = meta_data, permutations = 999)
+print("PERMANOVA Results for Caspian vs Mediterranean Sea")
+print(permanova_basin)
+
+
+#Taxa plot
+library(tidyverse)
+library(phyloseq)
+
+
+#phyloseq object
+justbacteria
+
+head(sample_data(justbacteria))
+
+#convert to dataframe
+
+genusabundance <- justbacteria %>%
+  tax_glom(taxrank = "Genus") %>%                        # Set to smallest taxonomic level you are interested in
+  transform_sample_counts(function(x) {x/sum(x)} ) %>%   # Transform to rel. abundance
+  psmelt()                                               # Melt to long format
+head(genusabundance)
+
+
+#Filter, group and modify data to prepare for plotting
+
+all <- genusabundance %>%
+  select(Phylum, Class, Family, Genus, Sample, Abundance, Depth, Location) %>%
+  filter(Abundance != 0) %>%
+  mutate(
+    Phylum = as.character(Phylum),
+    Class = as.character(Class),
+    Family = as.character(Family),
+    Genus = as.character(Genus))
+head(all)
+
+#Prepare to plot Phylum 
+
+phylum <- all %>%
+  select(Depth, Location, Phylum, Abundance) %>%  #choose variables to work with
+  group_by(Depth, Location) %>%                   #group by variables used to plot NOT taxonomic level
+  mutate(totalSum = sum(Abundance)) %>%                                 #calculate total abundance of each Phylum
+  ungroup() %>%                                                         #remove grouping variables
+  group_by(Depth, Location, Phylum) %>%           #group by same variables PLUS taxonomic level
+  summarise(                                                            
+    Abundance = sum(Abundance),                                         #sum abundance in each phylum for each  group
+    totalSum,
+    RelAb = Abundance/totalSum) %>%                                     #calculate relative abundance
+  unique()
+
+head(phylum)
+
+#look at descriptive statistics to check that everything is as we would expect. 
+#Maximum relative abundance should be no more than one, and the minimum should 
+#be greater than zero. The mean should be between the maximum and the minimum.
+
+max(phylum$RelAb)
+
+mean(phylum$RelAb)
+
+min(phylum$RelAb)
+
+#prepare colors for the plot
+
+length(unique(phylum$Phylum))
+
+phylum_colors <- c(
+  "grey22", "darkcyan", "orchid1", "green", "blue", "tomato2", "olivedrab",
+  "cyan", "coral3", "darkgreen", "magenta", "palegoldenrod", "dodgerblue", "firebrick", "yellow", "purple4",
+  "lightblue", "grey77", "mediumpurple1", "tan4", "red", "darkblue", "yellowgreen", "thistle1", "antiquewhite4", "cornflowerblue", "orange", "brown", "pink", "limegreen","slateblue", "lightcoral", "chocolate", "goldenrod", "seagreen","darkkhaki", "plum", "deeppink", "navy", "lightseagreen", "darkviolet", "turquoise", "sandybrown"
+)
+  
+length(phylum_colors)
+
+colFunc <- colorRampPalette(c("purple4", "lightpink", "firebrick", "orange", "lemonchiffon", "olivedrab4", "darkcyan", "lightblue", "darkblue"))
+color_list <- colFunc(length(unique(phylum$Phylum)))
+Phylum_colors <- c("black", color_list)
+length(Phylum_colors)
+
+#make the plot
+# Plot - phylum Final graph
+
+ggplot(phylum)+
+  geom_col(mapping = aes(x = Depth, y = RelAb, fill = Phylum), color = "black", position = "stack", show.legend = TRUE)+
+  facet_grid(cols = vars(Location, )) +
+  ylab("Proportion of Community") +
+  xlab(NULL)+
+  scale_fill_manual(values = phylum_colors) +
+  #scale_x_discrete(labels = c("0-4 cm", "4-8 cm", "8-12 cm","12-16 cm", "16-20 cm", "20-24 cm", "24-29 cm", "28-35 cm")) +  # Set the labels
+  theme_linedraw()+
+  theme(axis.text.y = element_text(size = 12, color = "black"),
+        axis.title.y = element_text(size = 12, color = "black"),
+        axis.text.x = element_text(size = 10, angle = 90, vjust = 0.5, hjust = 1, color = "black"),
+        legend.text = element_text(size = 13),
+        legend.position = "bottom",
+        legend.spacing.x = unit(0.1, 'mm'),
+        legend.spacing.y = unit(0.05, 'mm'),
+        plot.margin=grid::unit(c(0.1,0.1,0.1,0.1), "mm"),
+        strip.text = element_text(size = 18, face = "bold", angle = 0),
+        legend.title = element_text(face="bold", size = 22))+
+  guides(fill=guide_legend(ncol=3,byrow=TRUE))
+
+
+#Genus
+
+#plotting other taxonomic levels, grouping low abundance taxa
+
+genus <- all %>%
+  select(Depth, Location, Genus, Abundance) %>%
+  group_by(Depth, Location) %>%
+  mutate(totalSum = sum(Abundance)) %>%
+  ungroup() %>%
+  group_by(Depth, Location, Genus) %>%
+  summarise(
+    Abundance = sum(Abundance),
+    totalSum,
+    RelAb = Abundance/totalSum) %>%
+  unique()
+
+#Check the distribution of the data, max, mean and minimum should all be between 
+#1 and >0. Here we also check the number of unique genera, there are 535! It 
+#would be impossible to visualize 535 colors in a single figure.
+
+max(genus$RelAb)
+mean(genus$RelAb)
+min(genus$RelAb)
+
+length(unique(genus$Genus))
+
+#One solution for this is to group low abundance genera into a single category. 
+#Starting with the data frame “all” created earlier, we will group all of the 
+#genera present at less than 5% relative abundance into a single group.
+
+genus <- all %>%
+  select(Depth, Location, Genus, Abundance) %>%
+  group_by(Depth, Location) %>%
+  mutate(totalSum = sum(Abundance)) %>%
+  ungroup() %>%
+  group_by(Depth, Location, Genus, totalSum) %>%
+  summarise(
+    Abundance = sum(Abundance),
+    Genus = ifelse(Abundance < 0.05, "< 5%", Genus)) %>%               #change Genus label to group low abundance taxa together
+  group_by(Depth, Location, Genus, totalSum) %>%  #now group and summarize again to group newly labeled low abundance taxa together
+  summarise(
+    Abundance = sum(Abundance),
+    RelAb = Abundance/totalSum) %>%
+  unique()
+
+# Plot genus 
+
+# Limit to the top 20 most abundant genera for visualization
+top_genera <- genus %>%
+  group_by(Genus) %>%
+  summarize(total_abundance = sum(RelAb)) %>%
+  arrange(desc(total_abundance)) %>%
+  top_n(20, wt = total_abundance) %>%
+  pull(Genus)
+
+genus$Genus <- ifelse(genus$Genus %in% top_genera, genus$Genus, "< 5%")
+
+# Define a color palette for the genera
+unique_genera <- unique(genus$Genus)
+colFunc <- colorRampPalette(c("purple4", "lightpink", "firebrick", "orange", "lemonchiffon", "olivedrab4", "darkcyan", "lightblue", "darkblue"))
+genus_colors <- colFunc(length(unique_genera))
+
+genus$Depth <- factor(genus$Depth, levels = c("0-4 cm", "4-8 cm", "8-12 cm", "12-16 cm", "16-20 cm", "20-24 cm", "24-29 cm",  "28-35 cm"))
+
+# Filter out genera with very low abundance
+genus_filtered <- genus %>%
+  filter(RelAb > 0.01)  # Exclude genera with less than 1% relative abundance
+
+# Plotting code
+ggplot(genus_filtered) +
+  geom_col(mapping = aes(x = Depth, y = RelAb, fill = Genus), color = "black",   position = "stack", show.legend = TRUE) +
+  facet_grid(cols = vars(Location)) +
+  ylab("Proportion of Community") +
+  xlab(NULL) +
+  scale_fill_manual(values = genus_colors) +
+  theme_linedraw() +
+  theme(
+    axis.text.y = element_text(size = 10, color = "black"),  # Adjusted size for better readability
+    axis.title.y = element_text(size = 12, color = "black"),
+    axis.text.x = element_text(size = 10, angle = 90, vjust = 0.5, hjust = 1, color = "black"),  # Adjusted size and angle
+    legend.text = element_text(size = 11),
+    legend.position = "bottom",  # Position the legend at the bottom
+    legend.spacing.x = unit(0.1, 'mm'),
+    legend.spacing.y = unit(0.05, 'mm'),
+    plot.margin = grid::unit(c(0.1, 0.1, 0.1, 0.1), "mm"),
+    strip.text = element_text(size = 16, face = "bold", angle = 0),
+    legend.title = element_text(face = "bold", size = 18)
+  ) +
+  guides(fill = guide_legend(ncol = 2, byrow = TRUE))  # Adjusted number of columns in legend
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
